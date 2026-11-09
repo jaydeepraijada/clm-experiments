@@ -12,9 +12,14 @@ configs stored inside their public checkpoints (jackyk02/qwen3_8b_head):
 
 Held out, as in their notes: shard_00/0028-0029 (hard negatives), shard_05/0083-0084 (general).
 
-    modal run --detach train_heads.py --stage pre
-    modal run --detach train_heads.py --stage mid --init /data/runs/pre/best.pt
+    python pipeline/train_heads.py --stage pre --max-steps 30000
+    python pipeline/train_heads.py --stage mid --init $DATA_DIR/runs/pre/best.pt --run mid
+
+On the Spark (121 GB unified memory, shared) the chunk pool is smaller than on Modal (24 chunks, 256 GB RAM):
+up to ~3 pools are alive at once, so --group defaults to 6 chunks (~10 GB per pool) for Q&A-only stages and 1
+chunk when hard negatives (8.2 GB per chunk) are read. Batches then mix fewer chunks than the Modal run did.
 """
+import argparse
 import glob
 import json
 import math
@@ -23,17 +28,8 @@ import queue
 import threading
 import time
 
-import modal
+from common import atomic_save, data
 
-TORCH = ["torch==2.5.1", "numpy==2.1.3", "pyarrow==18.1.0", "huggingface_hub==0.26.2", "hf_transfer==0.1.8"]
-image = modal.Image.debian_slim(python_version="3.11").pip_install(*TORCH).env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
-vol = modal.Volume.from_name("clm-data", create_if_missing=True, version=2)
-QA = "Contrastive-LM/CLM-v0.1-Pretrain-Nemotron"
-QA_REV = "05ca7d05c043350326c5e86c589b9542962747b4"
-NEG = "jackyk02/nemotron_dqa_qwen3_8b_neg_embeddings"
-HEADS = "jackyk02/qwen3_8b_head"
-
-app = modal.App("clm-train-heads")
 DIM, WIDTH, PROJ = 4096, 1536, 512
 HOLD_GEN = {("shard_05", 83), ("shard_05", 84)}
 HOLD_HN = {("shard_00", 28), ("shard_00", 29)}
@@ -41,24 +37,43 @@ HOLD_HN = {("shard_00", 28), ("shard_00", 29)}
 
 def chunks():
     out = []
-    for p in sorted(glob.glob("/data/qa/shard_*/chunk_*_q.npy")):
+    for p in sorted(glob.glob(data("qa", "shard_*", "chunk_*_q.npy"))):
         out.append((p.split("/")[-2], int(p.split("_")[-2])))
     return out
 
 
 def stem(c, kind="qa"):
-    return f"/data/{kind}/{c[0]}/chunk_{c[1]:04d}"
+    return data(kind, c[0], f"chunk_{c[1]:04d}")
 
 
-def read_chunk(c, negs=False):
+def complete(c, negs=False):
+    fs = [stem(c) + s for s in ("_q.npy", "_a.npy", "_meta.parquet")]
+    if negs:
+        fs += [stem(c, "neg") + s for s in ("_n.npy", "_ncnt.npy")]
+    return all(os.path.exists(f) for f in fs)
+
+
+def read_chunk(c, negs=False, mmap=False):
     import numpy as np, pyarrow.parquet as pq, zlib
     d = {"q": np.load(stem(c) + "_q.npy"), "a": np.load(stem(c) + "_a.npy")}
     ids = pq.read_table(stem(c) + "_meta.parquet", columns=["doc_id"]).column("doc_id").to_pylist()
     d["doc"] = np.fromiter((zlib.crc32(x.encode()) for x in ids), dtype=np.int64, count=len(ids))
     if negs:
-        d["n"] = np.load(stem(c, "neg") + "_n.npy")
+        d["n"] = np.load(stem(c, "neg") + "_n.npy", mmap_mode="r" if mmap else None)
         d["c"] = np.load(stem(c, "neg") + "_ncnt.npy")
     return d
+
+
+def take(parts, i, j):
+    """Rows i:j of the concatenation of `parts`, without concatenating (parts may be memory-mapped)."""
+    import numpy as np
+    out, off = [], 0
+    for p in parts:
+        lo, hi = max(i - off, 0), min(j - off, len(p))
+        if lo < hi:
+            out.append(np.asarray(p[lo:hi]))
+        off += len(p)
+    return out[0] if len(out) == 1 else np.concatenate(out)
 
 
 def make_head():
@@ -137,16 +152,14 @@ def batches(order, group, batch, negs, seed, stop, repeats=1):
         yield item
 
 
-@app.function(image=image, volumes={"/data": vol}, gpu="L40S", cpu=32, memory=256000, timeout=86000,
-              retries=modal.Retries(max_retries=4, initial_delay=30.0))
-def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=None, smoke=False, seed=1234, max_steps=None, replay_negs=False, adir="vec"):
+def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=None, smoke=False, seed=1234, max_steps=None,
+          replay_negs=False, adir="vec", group=None, log_every=100, allow_partial=False):
     import numpy as np
     import torch
     import torch.nn.functional as F
     dev = "cuda"
-    vol.reload()
     run = run or stage
-    out = f"/data/runs/{run}"
+    out = data("runs", run)
     os.makedirs(out, exist_ok=True)
     torch.manual_seed(seed)
     lr = lr or (2e-3 * math.sqrt(1024 / WIDTH) * math.sqrt(batch / 1024) if stage == "pre" else 1e-3)
@@ -160,19 +173,29 @@ def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=Non
         sh.load_state_dict(ck["state_head"]); ah.load_state_dict(ck["action_head"])
         ls.data.copy_(torch.as_tensor(ck["logit_scale"]).float().to(dev))
 
+    def present(cs, negs, what):
+        ok = [c for c in cs if complete(c, negs)]
+        if len(ok) < len(cs):
+            msg = f"{what}: {len(cs) - len(ok)} of {len(cs)} chunks missing in {data()}"
+            if not allow_partial or not ok:
+                raise SystemExit(msg + " (stage the data, or pass --allow-partial for a smoke test)")
+            print("WARNING " + msg + ", continuing on the rest", flush=True)
+        return ok
+
     all_chunks = chunks()
+    uses_negs = stage == "mid" or (stage == "post" and replay_negs)
     if stage == "pre":
         order0 = [c for c in all_chunks if c not in HOLD_GEN and c not in HOLD_HN]
-        group, every, repeats = 24, 1000, 3
+        group0, every, repeats = 24, 1000, 3
     elif stage == "mid":
-        order0 = [("shard_00", i) for i in range(28)]
-        group, every, repeats = 6, 42, 1
+        order0 = present([("shard_00", i) for i in range(28)], True, "mid training")
+        group0, every, repeats = 6, 42, 1
     else:  # post: 60% agent steps, 40% Q&A replay; temperature frozen (their post and mid scales are identical)
         order0 = [c for c in all_chunks if c not in HOLD_GEN and c not in HOLD_HN]
-        group, every, repeats = 6, 25, 1
+        group0, every, repeats = 6, 25, 1
         ls.requires_grad_(False)
         import pyarrow.parquet as pq, zlib
-        metas = sorted(glob.glob("/data/agent/vec/*_meta.parquet"))
+        metas = sorted(glob.glob(data("agent", "vec", "*_meta.parquet")))
         aq = np.concatenate([np.load(m.replace("_meta.parquet", "_q.npy")) for m in metas])
         aa = np.concatenate([np.load(m.replace("_meta.parquet", "_a.npy").replace("/agent/vec/", f"/agent/{adir}/")) for m in metas])
         rows = [pq.read_table(m, columns=["traj", "split", "config"]) for m in metas]
@@ -183,13 +206,18 @@ def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=Non
         vq, va, vd = aq[isval], aa[isval], ad[isval]
         aq, aa, ad = aq[~isval], aa[~isval], ad[~isval]
         print(f"agent: {len(aq)} train steps, {len(vq)} val steps from {len(metas)} configs", flush=True)
-    print(f"{stage}: {len(order0)} training chunks, lr {lr:.6f}, batch {batch}", flush=True)
+    if not order0:
+        raise SystemExit(f"no training chunks found under {data('qa')}")
+    group = group or (1 if uses_negs else 6)
+    print(f"{stage}: {len(order0)} training chunks, lr {lr:.6f}, batch {batch}, pool {group} chunks "
+          f"(Modal used {group0})", flush=True)
 
-    # validation data stays in memory
-    gen = [read_chunk(c) for c in sorted(HOLD_GEN)]
+    # validation Q&A stays in memory; the 16 GB of held-out hard negatives are memory-mapped and read in slices
+    gen = [read_chunk(c) for c in present(sorted(HOLD_GEN), False, "held-out general")]
     gq, ga, gd = (np.concatenate([g[k] for g in gen]) for k in ("q", "a", "doc"))
-    hn = [read_chunk(c, True) for c in sorted(HOLD_HN)]
-    hq, ha, hd, hneg, hc = (np.concatenate([h[k] for h in hn]) for k in ("q", "a", "doc", "n", "c"))
+    hn = [read_chunk(c, True, mmap=True) for c in present(sorted(HOLD_HN), True, "held-out hard negatives")]
+    hq, ha, hd, hc = (np.concatenate([h[k] for h in hn]) for k in ("q", "a", "doc", "c"))
+    hneg = [h["n"] for h in hn]
     del gen, hn
 
     def T(x):
@@ -224,7 +252,7 @@ def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=Non
             j = min(i + 4096, len(hq))
             c = torch.from_numpy(hc[i:j].astype(np.int64)).to(dev)
             zq, za = F.normalize(sh(T(hq[i:j])), dim=-1), F.normalize(ah(T(ha[i:j])), dim=-1)
-            zn = F.normalize(ah(T(hneg[i:j]).view(-1, DIM)), dim=-1).view(j - i, 10, -1)
+            zn = F.normalize(ah(T(take(hneg, i, j)).view(-1, DIM)), dim=-1).view(j - i, 10, -1)
             pos = (zq * za).sum(-1, keepdim=True)
             neg = torch.einsum("bh,bkh->bk", zq, zn).masked_fill(torch.arange(10, device=dev)[None] >= c[:, None], -9.0)
             v = c > 0
@@ -236,7 +264,7 @@ def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=Non
         return {"hn_top1": hit / tot, "hn_loss": float(np.mean(L)), "hn_n": tot}
 
     step, epoch, best, stale = 0, 0, float("inf"), 0
-    latest = f"{out}/latest.pt"
+    latest = os.path.join(out, "latest.pt")
     if os.path.exists(latest):
         ck = torch.load(latest, map_location="cpu", weights_only=False)
         sh.load_state_dict(ck["state_head"]); ah.load_state_dict(ck["action_head"])
@@ -263,12 +291,13 @@ def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=Non
         m.update(step=step, epoch=epoch, scale=ls.exp().item(), minutes=(time.time() - t0) / 60)
         if score < best - 1e-4:
             best, stale = score, 0
-            torch.save(blob(), f"{out}/best.pt")
+            b = blob()
+            atomic_save(lambda t: torch.save(b, t), os.path.join(out, "best.pt"))
             m["best"] = True
         print(json.dumps(m), flush=True)
         log.write(json.dumps(m) + "\n"); log.flush()
-        torch.save({**blob(), "opt": opt.state_dict(), "best": best, "stale": stale}, latest)
-        vol.commit()
+        full_ck = {**blob(), "opt": opt.state_dict(), "best": best, "stale": stale}
+        atomic_save(lambda t: torch.save(full_ck, t), latest)
 
     t0 = time.time()
     if step == 0:
@@ -315,7 +344,7 @@ def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=Non
             torch.nn.utils.clip_grad_norm_(P, 1.0)
             opt.step()
             step += 1
-            if step == 1 or step % 100 == 0:
+            if step == 1 or step % log_every == 0:
                 print(f"step {step} loss {loss.item():.4f} scale {ls.exp().item():.1f} {(time.time()-t0)/60:.1f} min", flush=True)
             if step % every == 0:
                 checkpoint(step % (every * 4) == 0)
@@ -329,10 +358,31 @@ def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=Non
     checkpoint(True)
     m = {"finished": True, "step": step, "best": best, "minutes": (time.time() - t0) / 60}
     print(json.dumps(m), flush=True)
-    log.write(json.dumps(m) + "\n"); log.close(); vol.commit()
+    log.write(json.dumps(m) + "\n"); log.close()
     return m
 
 
-@app.local_entrypoint()
-def main(stage: str = "pre", init: str = "", run: str = "", smoke: bool = False, max_epochs: int = 0, max_steps: int = 0, lr: float = 0.0, replay_negs: bool = False, adir: str = "vec"):
-    print(train.remote(stage=stage, init=init or None, run=run or None, smoke=smoke, max_epochs=max_epochs or None, max_steps=max_steps or None, lr=lr or None, replay_negs=replay_negs, adir=adir))
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--stage", default="pre", choices=["pre", "mid", "post"])
+    ap.add_argument("--init", default=None, help="checkpoint to warm-start from")
+    ap.add_argument("--run", default=None, help="run name; output goes to $DATA_DIR/runs/<run> (default: the stage)")
+    ap.add_argument("--batch", type=int, default=16384)
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--max-epochs", type=int, default=None)
+    ap.add_argument("--max-steps", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--smoke", action="store_true", help="stop after 30 steps")
+    ap.add_argument("--replay-negs", action="store_true")
+    ap.add_argument("--adir", default="vec")
+    ap.add_argument("--group", type=int, default=None, help="chunks per shuffle pool (default 6, or 1 with hard negatives)")
+    ap.add_argument("--log-every", type=int, default=100)
+    ap.add_argument("--allow-partial", action="store_true", help="train on whatever chunks are staged (smoke tests)")
+    a = ap.parse_args()
+    print(json.dumps(train(stage=a.stage, init=a.init, run=a.run, batch=a.batch, lr=a.lr, max_epochs=a.max_epochs, smoke=a.smoke,
+                           seed=a.seed, max_steps=a.max_steps, replay_negs=a.replay_negs, adir=a.adir, group=a.group,
+                           log_every=a.log_every, allow_partial=a.allow_partial)))
+
+
+if __name__ == "__main__":
+    main()

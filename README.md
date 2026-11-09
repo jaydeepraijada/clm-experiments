@@ -24,7 +24,28 @@ Each head takes the last-token hidden state (4096-d), normalizes it, then runs 4
 | Verifier | DeepSWE steps | `run_deepswe.py` |
 | Evaluation | Held-out Q&A shards, T-Rex | `final_eval.py`, `run_trex.py` |
 
-## Run it
+## Run it on the DGX Spark
+
+The `dgx-port` branch runs stages as plain Python scripts inside NVIDIA containers, one stage at a time.
+Ported so far: `stage_data.py`, `train_heads.py` (pre-training). The other scripts are still the Modal versions.
+
+```bash
+rsync -a --delete --exclude .git ./ dgx:~/clm-experiments/      # from the Mac
+ssh dgx && cd ~/clm-experiments
+./run.sh stage_data --dry-run                                     # what is missing, and whether it fits on disk
+./run.sh --bg pre train_heads --stage pre --max-steps 30000       # tmux session clm-pre, log in $DATA_DIR/logs/
+```
+
+- `DATA_DIR` (default `~/clm-data`) replaces the Modal volume `/data`. It and `HF_HOME` are mounted at the same
+  path in the container, so a checkpoint path works on the host and inside the container.
+- Images: `nvcr.io/nvidia/pytorch:26.06-py3` for data and training, `nvcr.io/nvidia/vllm:26.05.post1-py3` for embedding.
+  The pinned `torch==2.5.1` / `vllm==0.11.0` do not support the GB10.
+- Every stage resumes: downloads skip finished files, and training continues from `runs/<run>/latest.pt`.
+- The GPU and its 121 GB of unified memory are shared with other services. `--group` keeps training's chunk pool
+  small (default 6 chunks, 1 with hard negatives; Modal used 24). Keep vLLM `gpu_memory_utilization` around 0.3-0.4.
+- Full data is ~1.27 TB. Check free space with `stage_data --dry-run` before staging everything.
+
+## Run it on Modal (original)
 
 You need a [Modal](https://modal.com) account and about 1.3 TB of volume storage.
 

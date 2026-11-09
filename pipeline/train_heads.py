@@ -345,7 +345,7 @@ def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=Non
             opt.step()
             step += 1
             if step == 1 or step % log_every == 0:
-                print(f"step {step} loss {loss.item():.4f} scale {ls.exp().item():.1f} {(time.time()-t0)/60:.1f} min", flush=True)
+                print(f"step {step} loss {loss.item():.4f} scale {ls.exp().item():.1f} {(time.time()-t0)/60:.2f} min", flush=True)
             if step % every == 0:
                 checkpoint(step % (every * 4) == 0)
             if (smoke and step >= 30) or (max_steps and step >= max_steps) or stale >= limit:

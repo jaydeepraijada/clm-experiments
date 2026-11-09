@@ -1,0 +1,7 @@
+clm-experiments
+
+The code in pipeline/ is derived from work licensed under the Apache License 2.0
+(https://github.com/VizuaraAI/system-one-from-scratch) and has been modified.
+
+The CLM method is by Kwok et al., "Contrastive Language Models", Stanford and
+NVIDIA Research, 2026. Nemotron-derived data is under the NVIDIA Open Data License.

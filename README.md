@@ -2,7 +2,7 @@
 
 Training and evaluating an open System One model in the style of CLM-8B ("Contrastive Language Models", Kwok et al., Stanford and NVIDIA Research, 2026).
 
-A System One model doesn't generate text. You give it a situation and a list of options, and it returns a probability for each option in one forward pass.
+A System One model doesn't generate text. You give it a situation and a list of options, and it returns a probability for each option. The situation and each option go through the encoder once; no text is generated.
 
 ## The model
 
@@ -48,7 +48,7 @@ Setup notes:
 
 ## Targets
 
-These are the published CLM-8B numbers we aim to match, then beat:
+These are the published CLM-8B numbers we aim to match:
 
 | Test | Published |
 |---|---|
@@ -71,8 +71,8 @@ Run on Modal in November 2026, following the recipe in this README. "Authors" me
 | Tricky Q&A, after mid-training | 69.2% | 69.2% | 68.5% | 0.7 behind |
 | Tricky Q&A, after post-training | 68.5% | 68.6% | **69.0%** | ahead |
 | DeepSWE, seed 1234 | 31/38 | 31/38 | 30/38 | |
-| DeepSWE, mean of 5 seeds | | 31.0/38 | **30.8/38** | tie |
-| T-Rex, median latency (L40S) | 16.5 ms | 17.0 ms | **17.1 ms** | same |
+| DeepSWE, mean of 5 seeds (random pick 28, perfect pick 34) | | 31.0/38 | **30.8/38** | tie |
+| T-Rex, median decision latency in the 60 FPS game loop (L40S) | 16.5 ms | 17.0 ms | 17.1 ms | same |
 | T-Rex, courses survived, shield on | 5/5 | 5/5 | 3/5 | behind |
 | T-Rex, planner agreement, shield on | 65.8% | 65.3% | 2.7% | far behind |
 
@@ -84,12 +84,6 @@ Other numbers from the same runs:
 | General Q&A top-1 (200k pairs, 1,024-way) | 1.9% | 83.3% | 83.2% | 82.7% |
 | Agent top-1 (our ADP v2 validation, 26,860 pairs, 1,024-way) | | | 0.5% | 19.6% |
 
-Recorded T-Rex games, course seed 0, the CLM authors' head above ours (made with `render_game.py`):
-
-| Shield on | Shield off (the model decides alone) |
-|---|---|
-| ![T-Rex, shield on](assets/trex_shield_authors_vs_ours.gif) | ![T-Rex, shield off](assets/trex_noshield_authors_vs_ours.gif) |
-
 ### What we found
 
 - **Pre-training**: 30,000 steps, 2.4 h on one L40S. `best.pt` is chosen by general loss, which kept step 30,000
@@ -100,9 +94,12 @@ Recorded T-Rex games, course seed 0, the CLM authors' head above ours (made with
 - **Post-training**: 914,106 agent pairs from 39 ADP v2 configs (the six-steps-per-recording sample of
   `build_agent_data.py`), about 1.56B tokens embedded on H100s (~8.5 GPU-hours), then 400 steps in 7 min.
   Replaying hard negatives kept tricky Q&A at 69.0%.
-- **DeepSWE** ties: the authors' head itself varies 30-32/38 across seeds.
-- **T-Rex** is the open gap. A sweep over every stage shows our pre and mid heads are as poor at the game as the authors'
-  mid head (18-25% planner agreement); the authors' post-training lifts theirs to ~79%, ours drops to ~2%.
+- **DeepSWE** ties: the authors' head itself varies 30-32/38 across seeds. Each run first fine-tunes the head on
+  DeepSWE's training tasks; 21 of the 38 held-out tasks have all 4 candidates passing and 4 have none, so only 13
+  are decided by the pick (ours 9, theirs 10, random 7).
+- **T-Rex** is the open gap. In a sweep of short games (2 per head, shield on), our mid head is as poor at the game as
+  the authors' mid head (18-19% planner agreement); the authors' post-training lifts theirs to ~79%, ours drops to ~2%,
+  so the gap most likely comes from post-training. (The full 5-course runs give 65.3% vs 2.7%.)
   Our post head almost never picks "run", the most common right answer. Two things we ruled out:
   wrapping the game state in the chat template does not help (25-27% offline either way), and embedding bare actions
   without narration (`embed_actions.py`, run `post_v2`) helps only a little (10% in the sweep).
@@ -124,6 +121,11 @@ post-training, evaluations, DeepSWE seeds and T-Rex runs ~$10.
 - `build_agent_data.py` resumes broken downloads with HTTP Range requests (five configs of 0.5-7.7 GB failed
   mid-stream without it) and takes `--only`. Config names containing a dot (`allenai_Sera-4.6-Lite-T2`) are still skipped.
 - `embed_agent.py` and `embed_agent_h100.py` take `--only`.
+
+## Credits
+
+The pipeline code is adapted from [VizuaraAI/system-one-from-scratch](https://github.com/VizuaraAI/system-one-from-scratch)
+(Apache 2.0). The CLM method, data and reference heads are by Kwok et al. (Stanford and NVIDIA Research).
 
 ## Licence
 

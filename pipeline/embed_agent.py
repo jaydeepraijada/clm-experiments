@@ -82,12 +82,14 @@ class Embedder:
 
 
 @app.function(image=image, volumes={"/data": vol}, timeout=14000)
-def orchestrate():
+def orchestrate(only=""):
     from huggingface_hub import snapshot_download
     vol.reload()
     snapshot_download("Qwen/Qwen3-8B", revision=REV, local_dir="/data/qwen3-8b", allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja"])
     vol.commit()
     files = sorted(glob.glob("/data/agent/pairs/*.parquet"))
+    if only:  # a comma list of config names, e.g. to embed late-built configs while another run is busy
+        files = [f for f in files if os.path.basename(f)[:-8] in only.split(",")]
     print(len(files), "configs", flush=True)
     total = 0
     for r in Embedder().run.map(files, order_outputs=False, return_exceptions=True):
@@ -99,5 +101,5 @@ def orchestrate():
 
 
 @app.local_entrypoint()
-def main():
-    orchestrate.remote()
+def main(only: str = ""):
+    orchestrate.remote(only)

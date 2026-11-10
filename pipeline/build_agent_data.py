@@ -45,6 +45,36 @@ def action_text(step):
     return "\n".join(parts).strip()
 
 
+def lines(url, tries=30):
+    """Stream a file's lines; when the connection breaks, reopen with an HTTP Range request at the last byte received.
+    The largest ADP files are several GB and a single stream often drops partway."""
+    import time
+    import requests
+    pos, buf, fails = 0, b"", 0
+    while True:
+        try:
+            r = requests.get(url, stream=True, timeout=120, headers={"Range": f"bytes={pos}-"} if pos else {})
+            r.raise_for_status()
+            if pos and r.status_code != 206:
+                raise RuntimeError(f"server ignored the Range request ({r.status_code})")
+            for chunk in r.iter_content(1 << 20):
+                pos += len(chunk)
+                buf += chunk
+                *done, buf = buf.split(b"\n")
+                yield from done
+            r.close()
+            if buf:
+                yield buf
+            return
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            fails += 1
+            if fails > tries:
+                raise
+            print(f"stream broke at {pos/1e9:.2f} GB ({type(e).__name__}), resuming", flush=True)
+            time.sleep(min(60, 5 * fails))
+
+
 def pairs_from(rec, rng):
     """-> [(state messages, action, step index)], at most PER_TRAJ, only for recordings that act repeatedly."""
     hist, out = [], []
@@ -73,7 +103,7 @@ def pairs_from(rec, rng):
 @app.function(image=image, volumes={"/data": vol}, cpu=2, memory=8192, timeout=7200, max_containers=24,
               retries=modal.Retries(max_retries=3, initial_delay=30.0))
 def build(config):
-    import pyarrow as pa, pyarrow.parquet as pq, requests
+    import pyarrow as pa, pyarrow.parquet as pq
     from huggingface_hub import HfApi
     rng = random.Random(zlib.crc32(config.encode()))
     files = sorted(x.path for x in HfApi().list_repo_tree(REPO, f"{config}/raw", repo_type="dataset")
@@ -82,9 +112,8 @@ def build(config):
     for f in files:
         if len(rows) >= QUOTA:
             break
-        r = requests.get(f"https://huggingface.co/datasets/{REPO}/resolve/main/{f}", stream=True, timeout=120)
-        r.raise_for_status()
-        for line in r.iter_lines():
+        it = lines(f"https://huggingface.co/datasets/{REPO}/resolve/main/{f}")
+        for line in it:
             if len(rows) >= QUOTA:
                 break
             if not line:
@@ -99,7 +128,7 @@ def build(config):
             for state, action, step in pairs_from(rec, rng):
                 rows.append({"config": config, "traj": tid, "step": step, "split": split,
                              "state": json.dumps(state, ensure_ascii=False), "action": action})
-        r.close()
+        it.close()
     if rows:
         os.makedirs("/data/agent/pairs", exist_ok=True)
         pq.write_table(pa.Table.from_pylist(rows), f"/data/agent/pairs/{config}.parquet", compression="zstd")
@@ -109,10 +138,12 @@ def build(config):
 
 
 @app.function(image=image, timeout=14000)
-def orchestrate():
+def orchestrate(only=""):
     from huggingface_hub import HfApi
     configs = [x.path for x in HfApi().list_repo_tree(REPO, repo_type="dataset") if not x.path.startswith(".") and "." not in x.path]
     configs = [c for c in configs if c not in VISION]
+    if only:
+        configs = [c for c in configs if c in only.split(",")]
     print(len(configs), "configs", flush=True)
     res = [r for r in build.map(configs, order_outputs=False, return_exceptions=True)]
     ok = [r for r in res if isinstance(r, dict)]
@@ -125,5 +156,5 @@ def orchestrate():
 
 
 @app.local_entrypoint()
-def main():
-    print(orchestrate.remote())
+def main(only: str = ""):
+    print(orchestrate.remote(only))

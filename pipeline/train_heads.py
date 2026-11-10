@@ -264,12 +264,14 @@ def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=Non
         return {"hn_top1": hit / tot, "hn_loss": float(np.mean(L)), "hn_n": tot}
 
     step, epoch, best, stale = 0, 0, float("inf"), 0
+    hn_best = [0.0]  # highest hard-negative top-1 so far; that checkpoint is kept as best_hn.pt
     latest = os.path.join(out, "latest.pt")
     if os.path.exists(latest):
         ck = torch.load(latest, map_location="cpu", weights_only=False)
         sh.load_state_dict(ck["state_head"]); ah.load_state_dict(ck["action_head"])
         ls.data.copy_(ck["logit_scale"].to(dev)); opt.load_state_dict(ck["opt"])
         step, epoch, best, stale = ck["step"], ck["epoch"], ck["best"], ck["stale"]
+        hn_best[0] = ck.get("hn_best", 0.0)
         print(f"resumed at step {step}, epoch {epoch}", flush=True)
 
     def blob():
@@ -294,9 +296,14 @@ def train(stage="pre", init=None, run=None, batch=16384, lr=None, max_epochs=Non
             b = blob()
             atomic_save(lambda t: torch.save(b, t), os.path.join(out, "best.pt"))
             m["best"] = True
+        if m.get("hn_top1", 0.0) > hn_best[0]:
+            hn_best[0] = m["hn_top1"]
+            b = blob()
+            atomic_save(lambda t: torch.save(b, t), os.path.join(out, "best_hn.pt"))
+            m["best_hn"] = True
         print(json.dumps(m), flush=True)
         log.write(json.dumps(m) + "\n"); log.flush()
-        full_ck = {**blob(), "opt": opt.state_dict(), "best": best, "stale": stale}
+        full_ck = {**blob(), "opt": opt.state_dict(), "best": best, "stale": stale, "hn_best": hn_best[0]}
         atomic_save(lambda t: torch.save(full_ck, t), latest)
 
     t0 = time.time()

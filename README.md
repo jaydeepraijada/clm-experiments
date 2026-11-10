@@ -84,6 +84,12 @@ Other numbers from the same runs:
 | General Q&A top-1 (200k pairs, 1,024-way) | 1.9% | 83.3% | 83.2% | 82.7% |
 | Agent top-1 (our ADP v2 validation, 26,860 pairs, 1,024-way) | | | 0.5% | 19.6% |
 
+Recorded T-Rex games, course seed 0, the CLM authors' head above ours (made with `render_game.py`):
+
+| Shield on | Shield off (the model decides alone) |
+|---|---|
+| ![T-Rex, shield on](assets/trex_shield_authors_vs_ours.gif) | ![T-Rex, shield off](assets/trex_noshield_authors_vs_ours.gif) |
+
 ### What we found
 
 - **Pre-training**: 30,000 steps, 2.4 h on one L40S. `best.pt` is chosen by general loss, which kept step 30,000

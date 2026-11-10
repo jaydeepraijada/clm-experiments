@@ -1,6 +1,11 @@
 """Score any set of heads on the same three held-out tests, with one code path.
 
     modal run final_eval.py --heads "/data/heads/qwen3_8b_midtrained_head.pt,/data/runs/mid/best.pt"
+    modal run final_eval.py --heads "raw,/data/heads/qwen3_8b_pretrained_head.pt,/data/runs/pre/best.pt" --out pre_compare
+
+"raw" scores Qwen3-8B's vectors with plain cosine and no heads. It has no learned scale, so its losses are reported
+at the best of a few fixed scales (a best case for the baseline). The agent test runs only when /data/agent/vec has
+validation rows, i.e. after post-training data exists.
 """
 import glob
 import json
@@ -15,7 +20,7 @@ DIM = 4096
 
 
 @app.function(image=image, volumes={"/data": vol}, gpu="L40S", cpu=8, memory=96000, timeout=1800)
-def run(heads):
+def run(heads, out_name="final_eval"):
     import numpy as np, pyarrow.parquet as pq, torch, torch.nn as nn, torch.nn.functional as F
     dev = "cuda"
     vol.reload()
@@ -51,8 +56,10 @@ def run(heads):
             vq.append(np.load(m.replace("_meta.parquet", "_q.npy"))[v]); va.append(np.load(m.replace("_meta.parquet", "_a.npy"))[v])
             t = np.array(r.column("traj").to_pylist(), dtype=object)[v]; c = r.column("config")[0].as_py()
             vd.append(np.fromiter((zlib.crc32((c + x).encode()) for x in t), dtype=np.int64, count=len(t)))
-    vq, va, vd = np.concatenate(vq), np.concatenate(va), np.concatenate(vd)
-    print("agent val", len(vq), flush=True)
+    have_agent = len(vq) > 0
+    if have_agent:
+        vq, va, vd = np.concatenate(vq), np.concatenate(va), np.concatenate(vd)
+    print(f"agent val {len(vq)}" if have_agent else "no agent data: agent test skipped", flush=True)
 
     @torch.no_grad()
     def pairs(sh, ah, s, q, a, d):
@@ -67,27 +74,39 @@ def run(heads):
         return round(float(np.mean(L)), 4), round(hit / tot, 4)
 
     @torch.no_grad()
-    def tricky(sh, ah):
-        hit = tot = 0
+    def tricky(sh, ah, s):
+        hit = tot = 0; L = []
         for i in range(0, len(hq), 4096):
             j = min(i + 4096, len(hq)); c = torch.from_numpy(hc[i:j].astype(np.int64)).to(dev)
             zq, za = F.normalize(sh(T(hq[i:j])), dim=-1), F.normalize(ah(T(ha[i:j])), dim=-1)
             zn = F.normalize(ah(T(hn[i:j]).view(-1, DIM)), dim=-1).view(j - i, 10, -1)
             neg = torch.einsum("bh,bkh->bk", zq, zn).masked_fill(torch.arange(10, device=dev)[None] >= c[:, None], -9.0)
-            v = c > 0; hit += ((zq * za).sum(-1)[v] > neg[v].max(1).values).sum().item(); tot += v.sum().item()
-        return round(hit / tot, 4), tot
+            pos = (zq * za).sum(-1, keepdim=True)
+            v = c > 0; hit += (pos[v, 0] > neg[v].max(1).values).sum().item(); tot += v.sum().item()
+            lg = (s * torch.cat([pos, neg], 1)).masked_fill(torch.cat([torch.zeros_like(pos, dtype=torch.bool), neg <= -9.0], 1), float("-inf"))
+            L.append(F.cross_entropy(lg[v], torch.zeros(int(v.sum()), dtype=torch.long, device=dev)).item())
+        return round(hit / tot, 4), round(float(np.mean(L)), 4), tot
 
     out = {}
     for path in heads:
-        ck = torch.load(path, map_location="cpu", weights_only=False)
-        sh, ah = head(), head(); sh.load_state_dict(ck["state_head"]); ah.load_state_dict(ck["action_head"])
-        s = torch.as_tensor(ck["logit_scale"]).float().exp().clamp(max=100.0).item()
-        t, n = tricky(sh, ah); gl, gt = pairs(sh, ah, s, gq, ga, gd); al, at = pairs(sh, ah, s, vq, va, vd)
-        out[path] = dict(tricky_top1=t, n=n, gen_loss=gl, gen_top1=gt, agent_loss=al, agent_top1=at, scale=round(s, 1), step=ck.get("step"))
-        print("RESULT", path, json.dumps(out[path]), flush=True)
-    json.dump(out, open("/data/runs/final_eval.json", "w"), indent=1); vol.commit()
+        if path == "raw":
+            sh = ah = nn.Identity(); scales, step = (10.0, 30.0, 100.0, 300.0, 1000.0), None
+        else:
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+            sh, ah = head(), head(); sh.load_state_dict(ck["state_head"]); ah.load_state_dict(ck["action_head"])
+            scales, step = (torch.as_tensor(ck["logit_scale"]).float().exp().clamp(max=100.0).item(),), ck.get("step")
+        r = None
+        for s in scales:  # one scale for a head; for "raw", keep the scale with the lowest general loss
+            t, tl, n = tricky(sh, ah, s); gl, gt = pairs(sh, ah, s, gq, ga, gd)
+            if r is None or gl < r["gen_loss"]:
+                r = dict(tricky_top1=t, tricky_loss=tl, n=n, gen_loss=gl, gen_top1=gt, scale=round(s, 1), step=step)
+        if have_agent:
+            r["agent_loss"], r["agent_top1"] = pairs(sh, ah, r["scale"], vq, va, vd)
+        out[path] = r
+        print("RESULT", path, json.dumps(r), flush=True)
+    json.dump(out, open(f"/data/runs/{out_name}.json", "w"), indent=1); vol.commit()
 
 
 @app.local_entrypoint()
-def main(heads: str):
-    run.remote(heads.split(","))
+def main(heads: str, out: str = "final_eval"):
+    run.remote(heads.split(","), out)
